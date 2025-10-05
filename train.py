@@ -7,9 +7,13 @@ import torch.optim as optim # type: ignore
 from torch.utils.data import DataLoader, random_split # type: ignore
 from torchvision import transforms # type: ignore
 
+import os
 from tqdm import tqdm # type: ignore
 
-from utils import WeatherDataset
+
+from plot import plot_history, save_validation_comparison
+
+from utils import WeatherDataset, SpecificValueWeightedMSELoss
 from model import SpatioTemporalTransformer
 
 
@@ -17,22 +21,33 @@ DATA_DIR  = "/wetter/input/WetterDaten/"
 CACHE_DIR = "/wetter/input/WetterDatenCache/"
 
 LEARNING_RATE = 1e-4
-BATCH_SIZE = 8
+WEIGHT_DECAY = 1e-5
+BATCH_SIZE = 10
 EPOCHS = 10
 
 VALIDATION_SPLIT = 0.2 
 
-WINDOW_SIZE = 12       # 12 steps = 3 hours
-PREDICTION_STEPS = [1] # Predict 1 step (15 mins) ahead
+WINDOW_SIZE = 16       # 12 steps = 3 hours
+PREDICTION_STEPS = [1,2,4] # Predict 1 step (15 mins) ahead
 NUM_PREDICTIONS = len(PREDICTION_STEPS)
 
-IMG_SIZE = (530, 450) 
+IMG_SIZE = (530, 450)
 PATCH_SIZE = (4, 10, 15)
+
+OUTPUT_DIR = "/wetter/output"
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "best_model.pth")
+
+# Hex #6E6E6E is 110 in decimal. Normalized value is 110 / 255.
+NO_RAIN_VALUE = 110.0 / 255.0
+NO_RAIN_TOLERANCE = 0.02 # Pixels within +/- 2% of NO_RAIN_VALUE are "no-rain"
+RAIN_WEIGHT = 50.0       # Rain pixels are 50 times more important
 
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     use_amp = device.type == 'cuda'
 
@@ -53,8 +68,8 @@ if __name__ == "__main__":
     print(f"Training set size: {len(train_dataset)}")
     print(f"Validation set size: {len(val_dataset)}")
  
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=10,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=10, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
   
     print("Initializing model...")
     base_model = SpatioTemporalTransformer(
@@ -67,10 +82,18 @@ if __name__ == "__main__":
     
     base_model = torch.compile(base_model)
 
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(base_model.parameters(), lr=LEARNING_RATE)
+    criterion = SpecificValueWeightedMSELoss(
+        no_rain_value=NO_RAIN_VALUE,
+        tolerance=NO_RAIN_TOLERANCE,
+        rain_weight=RAIN_WEIGHT
+    )
+    optimizer = optim.AdamW(base_model.parameters(), lr=LEARNING_RATE,weight_decay=WEIGHT_DECAY)
 
     scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    best_val_mae = float('inf')
+    train_loss_history, val_loss_history = [], []
+    train_mae_history, val_mae_history = [], []
 
     print("\nStarting training...")
     for epoch in range(EPOCHS):
@@ -126,5 +149,31 @@ if __name__ == "__main__":
         print(f"Epoch [{epoch+1}/{EPOCHS}] | "
               f"Avg Train Loss: {avg_train_loss:.6f} | Avg Train MAE: {avg_train_mae:.6f} | "
               f"Avg Val Loss: {avg_val_loss:.6f} | Avg Val MAE: {avg_val_mae:.6f}")
+        
+        train_loss_history.append(avg_train_loss)
+        val_loss_history.append(avg_val_loss)
+        train_mae_history.append(avg_train_mae)
+        val_mae_history.append(avg_val_mae)
+        
+        if avg_val_mae < best_val_mae:
+            best_val_mae = avg_val_mae
+            print(f"  -> New best model found! Saving model and validation image...")
+            torch.save(base_model.state_dict(), CHECKPOINT_PATH)
+            
+            save_validation_comparison(
+                base_model, 
+                val_loader, 
+                device,
+                save_path=os.path.join(OUTPUT_DIR, "validation_comparison.png")
+            )
+        plot_history(train_loss_history, val_loss_history, train_mae_history, val_mae_history,
+                 save_path=os.path.join(OUTPUT_DIR, "training_history.png"))
 
     print("\nTraining finished.")
+    print(f"Best model saved at {CHECKPOINT_PATH} with a validation MAE of {best_val_mae:.6f}")
+    
+    print("\nGenerating final training history plot...")
+    plot_history(train_loss_history, val_loss_history, train_mae_history, val_mae_history,
+                 save_path=os.path.join(OUTPUT_DIR, "final_training_history.png"))
+
+    print("\nDone.")
