@@ -14,15 +14,17 @@ from tqdm import tqdm # type: ignore
 from plot import plot_history, save_validation_comparison
 
 from utils import WeatherDataset, SpecificValueWeightedMSELoss
+from utils import calculate_f1_score
 from model import SpatioTemporalTransformer
 
+torch.set_float32_matmul_precision('high')
 
 DATA_DIR  = "/wetter/input/WetterDaten/"
 CACHE_DIR = "/wetter/input/WetterDatenCache/"
 
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
-BATCH_SIZE = 10
+BATCH_SIZE = 8
 EPOCHS = 10
 
 VALIDATION_SPLIT = 0.2 
@@ -39,8 +41,10 @@ CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "best_model.pth")
 
 # Hex #6E6E6E is 110 in decimal. Normalized value is 110 / 255.
 NO_RAIN_VALUE = 110.0 / 255.0
-NO_RAIN_TOLERANCE = 0.02 # Pixels within +/- 2% of NO_RAIN_VALUE are "no-rain"
-RAIN_WEIGHT = 50.0       # Rain pixels are 50 times more important
+NO_RAIN_TOLERANCE = 0.02
+RAIN_WEIGHT = 50.0
+
+RAIN_THRESHOLD_F1 = NO_RAIN_VALUE + NO_RAIN_TOLERANCE
 
 
 if __name__ == "__main__":
@@ -68,13 +72,14 @@ if __name__ == "__main__":
     print(f"Training set size: {len(train_dataset)}")
     print(f"Validation set size: {len(val_dataset)}")
  
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=12,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=12, pin_memory=True, persistent_workers=True, prefetch_factor=2)
   
     print("Initializing model...")
     base_model = SpatioTemporalTransformer(
         img_size=IMG_SIZE,
         patch_size=PATCH_SIZE,
+        window_size=WINDOW_SIZE,
         in_chans=3, 
         embed_dim=192,
         num_predictions=NUM_PREDICTIONS
@@ -92,14 +97,17 @@ if __name__ == "__main__":
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
     best_val_mae = float('inf')
+    best_val_f1 = 0.0
     train_loss_history, val_loss_history = [], []
     train_mae_history, val_mae_history = [], []
+    train_f1_history, val_f1_history = [], []
 
     print("\nStarting training...")
     for epoch in range(EPOCHS):
         base_model.train()
         running_train_loss = 0.0
         running_train_mae = 0.0
+        running_train_f1 = 0.0
         
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Training]")
         for inputs, targets in train_pbar:
@@ -119,15 +127,19 @@ if __name__ == "__main__":
             with torch.no_grad():
                 mae = torch.mean(torch.abs(outputs - targets))
                 running_train_mae += mae.item()
+                f1 = calculate_f1_score(outputs, targets, RAIN_THRESHOLD_F1)
+                running_train_f1 += f1
 
-            train_pbar.set_postfix(loss=loss.item(), mae=mae.item())
+            train_pbar.set_postfix(loss=loss.item(), mae=mae.item(), f1=f1)
 
         avg_train_loss = running_train_loss / len(train_loader)
         avg_train_mae = running_train_mae / len(train_loader)
+        avg_train_f1 = running_train_f1 / len(train_loader)
         
         base_model.eval() 
         running_val_loss = 0.0
         running_val_mae = 0.0
+        running_val_f1 = 0.0
         
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Validation]")
         with torch.no_grad():
@@ -141,39 +153,33 @@ if __name__ == "__main__":
                 running_val_loss += loss.item()
                 mae = torch.mean(torch.abs(outputs - targets))
                 running_val_mae += mae.item()
-                val_pbar.set_postfix(loss=loss.item(), mae=mae.item())
+                f1 = calculate_f1_score(outputs, targets, RAIN_THRESHOLD_F1)
+                running_val_f1 += f1
+                val_pbar.set_postfix(loss=loss.item(), mae=mae.item(), f1=f1)
 
         avg_val_loss = running_val_loss / len(val_loader)
         avg_val_mae = running_val_mae / len(val_loader)
+        avg_val_f1 = running_val_f1 / len(val_loader)
 
         print(f"Epoch [{epoch+1}/{EPOCHS}] | "
-              f"Avg Train Loss: {avg_train_loss:.6f} | Avg Train MAE: {avg_train_mae:.6f} | "
-              f"Avg Val Loss: {avg_val_loss:.6f} | Avg Val MAE: {avg_val_mae:.6f}")
+              f"Avg Train Loss: {avg_train_loss:.6f} | Avg Train MAE: {avg_train_mae:.6f} | Avg Train F1: {avg_train_f1:.4f} | "
+              f"Avg Val Loss: {avg_val_loss:.6f} | Avg Val MAE: {avg_val_mae:.6f} | Avg Val F1: {avg_val_f1:.4f}")
         
         train_loss_history.append(avg_train_loss)
         val_loss_history.append(avg_val_loss)
         train_mae_history.append(avg_train_mae)
         val_mae_history.append(avg_val_mae)
+        train_f1_history.append(avg_train_f1)
+        val_f1_history.append(avg_val_f1)
         
-        if avg_val_mae < best_val_mae:
-            best_val_mae = avg_val_mae
-            print(f"  -> New best model found! Saving model and validation image...")
+        if avg_val_f1 > best_val_f1:
+            best_val_f1 = avg_val_f1
+            print(f"  -> New best model found! Saving model with Val F1: {best_val_f1:.4f}")
             torch.save(base_model.state_dict(), CHECKPOINT_PATH)
-            
-            save_validation_comparison(
-                base_model, 
-                val_loader, 
-                device,
-                save_path=os.path.join(OUTPUT_DIR, "validation_comparison.png")
-            )
-        plot_history(train_loss_history, val_loss_history, train_mae_history, val_mae_history,
+            save_validation_comparison(base_model, val_loader, device,
+                                       save_path=os.path.join(OUTPUT_DIR, "validation_comparison.png"))
+        plot_history(train_loss_history, val_loss_history, train_mae_history, val_mae_history, train_f1_history, val_f1_history,
                  save_path=os.path.join(OUTPUT_DIR, "training_history.png"))
 
     print("\nTraining finished.")
     print(f"Best model saved at {CHECKPOINT_PATH} with a validation MAE of {best_val_mae:.6f}")
-    
-    print("\nGenerating final training history plot...")
-    plot_history(train_loss_history, val_loss_history, train_mae_history, val_mae_history,
-                 save_path=os.path.join(OUTPUT_DIR, "final_training_history.png"))
-
-    print("\nDone.")

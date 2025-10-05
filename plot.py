@@ -1,20 +1,20 @@
 # plot.py
 
 import os
-import torch
-from torchvision import utils as vutils
-import matplotlib.pyplot as plt
+import torch # type: ignore
+from torchvision import utils as vutils # type: ignore
+import matplotlib.pyplot as plt # type: ignore
 
-def plot_history(train_loss, val_loss, train_mae, val_mae, save_path):
-    """Plots and saves the training and validation history for loss and MAE."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+def plot_history(train_loss, val_loss, train_mae, val_mae, train_f1, val_f1, save_path):
+    """Plots and saves the training history for loss, MAE, and F1-Score."""
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 18))
     
     fig.suptitle('Training Performance Metrics', fontsize=16)
 
-    # Plotting Loss Mean SSquare Error (MSE)
+    # Plotting Loss (MSE)
     ax1.plot(train_loss, label='Training Loss')
     ax1.plot(val_loss, label='Validation Loss')
-    ax1.set_title('Mean Squared Error (MSE) Loss')
+    ax1.set_title('Weighted Mean Squared Error (MSE) Loss')
     ax1.set_xlabel('Epochs')
     ax1.set_ylabel('Loss')
     ax1.legend()
@@ -23,16 +23,26 @@ def plot_history(train_loss, val_loss, train_mae, val_mae, save_path):
     # Plotting Mean Absolute Error (MAE)
     ax2.plot(train_mae, label='Training MAE')
     ax2.plot(val_mae, label='Validation MAE')
-    ax2.set_title('Mean Absolute Error (MAE)')
+    ax2.set_title('Unweighted Mean Absolute Error (MAE)')
     ax2.set_xlabel('Epochs')
     ax2.set_ylabel('MAE')
     ax2.legend()
     ax2.grid(True)
     
+    # Plotting F1-Score
+    ax3.plot(train_f1, label='Training F1-Score')
+    ax3.plot(val_f1, label='Validation F1-Score')
+    ax3.set_title('F1-Score (Rain Detection Accuracy)')
+    ax3.set_xlabel('Epochs')
+    ax3.set_ylabel('F1-Score')
+    ax3.set_ylim([0, 1]) # F1-Score is always between 0 and 1
+    ax3.legend()
+    ax3.grid(True)
+    
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(save_path)
     print(f"Training history plot saved to {save_path}")
-    plt.close() # Close the figure to free up memory
+    plt.close()
 
 def save_validation_comparison(model, dataloader, device, save_path):
     """Generates and saves a visual comparison for a validation batch."""

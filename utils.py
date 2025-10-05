@@ -135,7 +135,7 @@ class WeatherDataset(Dataset):
             
             tasks = [(idx, timestamp, self.root_dir, self.cache_dir, 
                       self.window_size, self.prediction, crop_params) for idx in missing_indices]
-            num_workers = 7 # num physical cores -1
+            num_workers = 8
             print(f"Starting processing with {num_workers} workers...")
             with multiprocessing.Pool(processes=num_workers) as pool:
                 list(tqdm(pool.imap_unordered(process_sample, tasks), total=len(tasks), desc="Generating cached videos"))
@@ -208,3 +208,67 @@ class SpecificValueWeightedMSELoss(nn.Module):
         # Apply the weights and return the mean
         weighted_squared_error = squared_error * weights
         return torch.mean(weighted_squared_error)
+    
+def calculate_f1_score_old(outputs, targets, threshold):
+    """Calculates the F1-score for rain detection."""
+    with torch.no_grad():
+        # Create binary masks based on the threshold
+        preds_binary = (outputs > threshold)
+        targets_binary = (targets > threshold)
+        
+        # True Positives, False Positives, False Negatives
+        tp = (preds_binary & targets_binary).sum().float()
+        fp = (preds_binary & ~targets_binary).sum().float()
+        fn = (~preds_binary & targets_binary).sum().float()
+        
+        # Precision and Recall
+        precision = tp / (tp + fp + 1e-6) # Add epsilon to avoid division by zero
+        recall = tp / (tp + fn + 1e-6)
+        
+        # F1-Score
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
+        return f1.item()
+    
+def calculate_f1_score(outputs, targets, threshold):
+    """
+    Calculates the F1-score for rain detection, but ONLY for samples
+    in the batch that actually contain rain in the ground truth.
+    If a batch contains no rain images, it returns a perfect score of 1.0.
+    """
+    with torch.no_grad():
+        # --- Step 1: Identify which images in the batch have rain ---
+        targets_binary = (targets > threshold)
+        # Sum over all dimensions except the batch dimension to get rain pixel count per image
+        rain_pixels_per_sample = targets_binary.sum(dim=[1, 2, 3, 4])
+        # Create a mask for samples that have at least one rain pixel
+        rainy_samples_mask = (rain_pixels_per_sample > 0)
+
+        # --- Step 2: Handle the case where the batch has NO rain ---
+        if rainy_samples_mask.sum() == 0:
+            # If there's no rain in the ground truth for this entire batch,
+            # and if the model also predicts no rain, it's doing a perfect job
+            # for this trivial case. We return 1.0.
+            preds_binary = (outputs > threshold)
+            if preds_binary.sum() == 0:
+                return 1.0
+            else:
+                # The model predicted rain where there was none. This is bad.
+                return 0.0
+
+        # --- Step 3: Filter the batch to only include rainy samples ---
+        rainy_outputs = outputs[rainy_samples_mask]
+        rainy_targets = targets[rainy_samples_mask]
+
+        # --- Step 4: Calculate F1 score on the filtered, relevant samples ---
+        preds_binary = (rainy_outputs > threshold)
+        targets_binary = (rainy_targets > threshold)
+        
+        tp = (preds_binary & targets_binary).sum().float()
+        fp = (preds_binary & ~targets_binary).sum().float()
+        fn = (~preds_binary & targets_binary).sum().float()
+        
+        precision = tp / (tp + fp + 1e-6)
+        recall = tp / (tp + fn + 1e-6)
+        
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
+        return f1.item()

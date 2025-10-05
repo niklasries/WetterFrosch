@@ -3,9 +3,9 @@ import torch.nn as nn # type: ignore
 
 
 class PatchEmbed3D(nn.Module):
-    def __init__(self, img_size=(530, 450), patch_size=(4, 10, 15), in_chans=3, embed_dim=768):
+    def __init__(self, img_size=(530, 450), patch_size=(4, 10, 15),window_size=12, in_chans=3, embed_dim=768):
         super().__init__()
-        num_patches = (img_size[0] // patch_size[1]) * (img_size[1] // patch_size[2]) * (12 // patch_size[0])
+        num_patches = (img_size[0] // patch_size[1]) * (img_size[1] // patch_size[2]) * (window_size // patch_size[0])
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
@@ -25,12 +25,12 @@ class PatchEmbed3D(nn.Module):
         return x
 
 class SpatioTemporalTransformer(nn.Module):
-    def __init__(self, img_size=(530, 450), patch_size=(4, 10, 15), in_chans=3, out_chans=1,
+    def __init__(self, img_size=(530, 450), patch_size=(4, 10, 15),window_size=12, in_chans=3, out_chans=1,
                  num_predictions=1, embed_dim=768, depth=6, num_heads=8,
                  mlp_ratio=4., dropout=0.1):
         super().__init__()
         self.num_predictions = num_predictions
-        self.patch_embed = PatchEmbed3D(img_size, patch_size, in_chans, embed_dim)
+        self.patch_embed = PatchEmbed3D(img_size, patch_size, window_size, in_chans, embed_dim)
         self.num_patches = self.patch_embed.num_patches
         self.embed_dim = embed_dim
         
