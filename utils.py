@@ -1,4 +1,3 @@
-
 # utils.py
 
 import os
@@ -13,9 +12,6 @@ import torch.nn as nn # type: ignore
 from torch.utils.data import Dataset # type: ignore
 from torchvision.io import read_image, ImageReadMode, write_video, read_video # type: ignore
 from tqdm import tqdm # type: ignore
-
-
-
 
 
 def process_sample(args):
@@ -54,15 +50,19 @@ def process_sample(args):
         target_ts_index = start_index + window_size + (step - 1)
         ts = all_timestamps[target_ts_index]
         img_path = os.path.join(root_dir, f"radar_{ts.strftime('%Y%m%d-%H%M')}.png")
-        tensor = read_image(img_path, mode="GRAY_ALPHA")
-        gray, alpha = tensor[0:1, :, :], tensor[1:2, :, :]
-        background = torch.full_like(gray, bg_color_uint8)
+        tensor = read_image(img_path, mode="RGB_ALPHA")
+        rgb, alpha = tensor[0:3, :, :], tensor[3:4, :, :]
+
+        background = torch.full_like(rgb, 0)
+        rain = torch.full_like(rgb, 255)
+
         mask = (alpha == 0)
-        filled_tensor = torch.where(mask, background, gray)
+        mask_6e = (rgb == bg_color_uint8)
+
+        filled_tensor = torch.where(mask, background, rain)
+        filled_tensor = torch.where(mask_6e,background,filled_tensor)
         cropped_tensor = filled_tensor[:, y_start:y_start+crop_height, x_start:x_start+crop_width]
-        # Repeat to 3 channels for video encoding
-        repeated_tensor = cropped_tensor.repeat(3, 1, 1)
-        radar_frames.append(repeated_tensor)
+        radar_frames.append(cropped_tensor)
     
     radar_video_tensor = torch.stack(radar_frames)
     radar_video_path = os.path.join(cache_dir, f"radar_{timestamp_str}.mp4")
@@ -75,7 +75,9 @@ class WeatherDataset(Dataset):
                  root_dir: str,
                  cache_dir: str,
                  window_size: int = 12,
-                 prediction: List[int] = [1],
+                 height: int = 540,
+                 width: int = 456,
+                 prediction: List[int] = [1], # [15,20,60] ->[1,2,4]
                  transform=None):
 
         self.root_dir = root_dir
@@ -85,10 +87,10 @@ class WeatherDataset(Dataset):
         self.prediction = sorted(prediction)
         self.max_step = self.prediction[-1]
 
-        self._init_cache()
+        self._init_cache(height,width)
         self.video_files = sorted([f for f in os.listdir(self.cache_dir) if f.startswith('sat_') and f.endswith('.mp4')])
 
-    def _init_cache(self):
+    def _init_cache(self,H,W):
         print("Verifying data cache...")
         os.makedirs(self.cache_dir, exist_ok=True)
         metadata_path = os.path.join(self.cache_dir, 'cache_info.json')
@@ -130,8 +132,8 @@ class WeatherDataset(Dataset):
         
         if missing_indices:
             print(f"Cache is incomplete. Found {len(missing_indices)} missing samples to generate.")
-            
-            crop_params = (70, 220, 530, 450)
+            #crop params for Germany
+            crop_params = (60, 220, H, W)
             
             tasks = [(idx, timestamp, self.root_dir, self.cache_dir, 
                       self.window_size, self.prediction, crop_params) for idx in missing_indices]
@@ -177,44 +179,34 @@ class WeatherDataset(Dataset):
         radar_frames, _, _ = read_video(radar_video_path, output_format="TCHW", pts_unit='sec')
         
         input_tensor = sat_frames.float() / 255.0
-        target_tensor = radar_frames[:, 0:1, :, :].float() / 255.0
+        target_tensor = radar_frames.float() / 255.0
 
         if self.transform:
             pass
             
         return input_tensor, target_tensor
     
-
-class SpecificValueWeightedMSELoss(nn.Module):
-    def __init__(self, no_rain_value, tolerance, rain_weight):
-        super(SpecificValueWeightedMSELoss, self).__init__()
-        self.no_rain_value = no_rain_value
-        self.tolerance = tolerance
-        self.rain_weight = rain_weight
+class WeightedBCELoss(nn.Module):
+    """
+    A wrapper around PyTorch's BCEWithLogitsLoss that applies a weight to the
+    positive class (rain) to handle class imbalance.
+    """
+    def __init__(self, rain_weight):
+        super(WeightedBCELoss, self).__init__()
+        self.pos_weight = torch.tensor([rain_weight])
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
 
     def forward(self, inputs, targets):
-        # Create a boolean mask where 1 indicates a rain pixel.
-        # Rain is any pixel value not within the tolerance band of the no-rain value.
-        is_rain_mask = torch.abs(targets - self.no_rain_value) > self.tolerance
-        
-        weights = torch.ones_like(targets)
-        
-        # Apply the high weight to the pixels identified by the mask
-        weights[is_rain_mask] = self.rain_weight
-        
-        # Calculate the standard squared error
-        squared_error = (inputs - targets) ** 2
-        
-        # Apply the weights and return the mean
-        weighted_squared_error = squared_error * weights
-        return torch.mean(weighted_squared_error)
-    
-def calculate_f1_score_old(outputs, targets, threshold):
-    """Calculates the F1-score for rain detection."""
+        return self.criterion(inputs, targets.float())
+
+def calculate_binary_metrics(outputs, targets):
+    """
+    Calculates F1, precision, and recall for a binary classification task.
+    """
     with torch.no_grad():
-        # Create binary masks based on the threshold
-        preds_binary = (outputs > threshold)
-        targets_binary = (targets > threshold)
+        # Apply sigmoid to convert logits to probabilities and threshold at 0.5 for binary classification
+        preds_binary = (torch.sigmoid(outputs) > 0.5)
+        targets_binary = targets.bool() # Ensure targets are boolean for bitwise ops
         
         # True Positives, False Positives, False Negatives
         tp = (preds_binary & targets_binary).sum().float()
@@ -222,53 +214,14 @@ def calculate_f1_score_old(outputs, targets, threshold):
         fn = (~preds_binary & targets_binary).sum().float()
         
         # Precision and Recall
-        precision = tp / (tp + fp + 1e-6) # Add epsilon to avoid division by zero
+        precision = tp / (tp + fp + 1e-6)
         recall = tp / (tp + fn + 1e-6)
         
         # F1-Score
         f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
-        return f1.item()
-    
-def calculate_f1_score(outputs, targets, threshold):
-    """
-    Calculates the F1-score for rain detection, but ONLY for samples
-    in the batch that actually contain rain in the ground truth.
-    If a batch contains no rain images, it returns a perfect score of 1.0.
-    """
-    with torch.no_grad():
-        # --- Step 1: Identify which images in the batch have rain ---
-        targets_binary = (targets > threshold)
-        # Sum over all dimensions except the batch dimension to get rain pixel count per image
-        rain_pixels_per_sample = targets_binary.sum(dim=[1, 2, 3, 4])
-        # Create a mask for samples that have at least one rain pixel
-        rainy_samples_mask = (rain_pixels_per_sample > 0)
-
-        # --- Step 2: Handle the case where the batch has NO rain ---
-        if rainy_samples_mask.sum() == 0:
-            # If there's no rain in the ground truth for this entire batch,
-            # and if the model also predicts no rain, it's doing a perfect job
-            # for this trivial case. We return 1.0.
-            preds_binary = (outputs > threshold)
-            if preds_binary.sum() == 0:
-                return 1.0
-            else:
-                # The model predicted rain where there was none. This is bad.
-                return 0.0
-
-        # --- Step 3: Filter the batch to only include rainy samples ---
-        rainy_outputs = outputs[rainy_samples_mask]
-        rainy_targets = targets[rainy_samples_mask]
-
-        # --- Step 4: Calculate F1 score on the filtered, relevant samples ---
-        preds_binary = (rainy_outputs > threshold)
-        targets_binary = (rainy_targets > threshold)
         
-        tp = (preds_binary & targets_binary).sum().float()
-        fp = (preds_binary & ~targets_binary).sum().float()
-        fn = (~preds_binary & targets_binary).sum().float()
-        
-        precision = tp / (tp + fp + 1e-6)
-        recall = tp / (tp + fn + 1e-6)
-        
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
-        return f1.item()
+        return {
+            'f1': f1.item(),
+            'precision': precision.item(),
+            'recall': recall.item()
+        }

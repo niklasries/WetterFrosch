@@ -11,10 +11,10 @@ import random
 import base64 
 
 # --- Selenium Imports ---
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
+from selenium import webdriver # type: ignore
+from selenium.webdriver.chrome.service import Service as ChromeService # type: ignore 
+from webdriver_manager.chrome import ChromeDriverManager # type: ignore
+from selenium.webdriver.chrome.options import Options  # type: ignore
 
 # --- Configuration ---
 SAT_PAGE_URL_TEMPLATE = "https://kachelmannwetter.com/de/sat/deutschland/satellit-nature-15min/{timestamp}z.html"

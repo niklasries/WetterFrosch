@@ -1,3 +1,4 @@
+# train.py
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message="The video decoding*")
 
@@ -9,18 +10,31 @@ from torchvision import transforms # type: ignore
 
 import os
 from tqdm import tqdm # type: ignore
-
+import shutil
 
 from plot import plot_history, save_validation_comparison
 
-from utils import WeatherDataset, SpecificValueWeightedMSELoss
-from utils import calculate_f1_score
+from utils import WeatherDataset, WeightedBCELoss
+from utils import calculate_binary_metrics
 from model import SpatioTemporalTransformer
+
+SEED = 42
+import random
+import numpy as np
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 torch.set_float32_matmul_precision('high')
 
-DATA_DIR  = "/wetter/input/WetterDaten/"
-CACHE_DIR = "/wetter/input/WetterDatenCache/"
+DATA_DIR  = "/wetter/input/WetterDatenSmol/"
+CACHE_DIR = "/wetter/input/WetterDatenCacheSmol/"
+
 
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
@@ -29,22 +43,21 @@ EPOCHS = 10
 
 VALIDATION_SPLIT = 0.2 
 
-WINDOW_SIZE = 16       # 12 steps = 3 hours
+WINDOW_SIZE = 8       # 12 steps = 3 hours
 PREDICTION_STEPS = [1,2,4] # Predict 1 step (15 mins) ahead
 NUM_PREDICTIONS = len(PREDICTION_STEPS)
 
-IMG_SIZE = (530, 450)
-PATCH_SIZE = (4, 10, 15)
+IMG_SIZE = (540, 456)
+PATCH_SIZE = (4, 8, 8)
 
 OUTPUT_DIR = "/wetter/output"
-CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "best_model.pth")
 
-# Hex #6E6E6E is 110 in decimal. Normalized value is 110 / 255.
-NO_RAIN_VALUE = 110.0 / 255.0
-NO_RAIN_TOLERANCE = 0.02
-RAIN_WEIGHT = 50.0
+BEST_CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "best_model.pth")
+LATEST_CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "latest_checkpoint.pth")
 
-RAIN_THRESHOLD_F1 = NO_RAIN_VALUE + NO_RAIN_TOLERANCE
+
+RAIN_WEIGHT = 10.0
+
 
 
 if __name__ == "__main__":
@@ -72,8 +85,8 @@ if __name__ == "__main__":
     print(f"Training set size: {len(train_dataset)}")
     print(f"Validation set size: {len(val_dataset)}")
  
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=12,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=12, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=10,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=10, pin_memory=True, persistent_workers=True, prefetch_factor=2)
   
     print("Initializing model...")
     base_model = SpatioTemporalTransformer(
@@ -87,31 +100,54 @@ if __name__ == "__main__":
     
     base_model = torch.compile(base_model)
 
-    criterion = SpecificValueWeightedMSELoss(
-        no_rain_value=NO_RAIN_VALUE,
-        tolerance=NO_RAIN_TOLERANCE,
-        rain_weight=RAIN_WEIGHT
-    )
+    criterion = WeightedBCELoss(rain_weight=RAIN_WEIGHT).to(device)
     optimizer = optim.AdamW(base_model.parameters(), lr=LEARNING_RATE,weight_decay=WEIGHT_DECAY)
 
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
-    best_val_mae = float('inf')
+    start_epoch = 0
     best_val_f1 = 0.0
     train_loss_history, val_loss_history = [], []
-    train_mae_history, val_mae_history = [], []
     train_f1_history, val_f1_history = [], []
+    train_precision_history, val_precision_history = [], []
+    train_recall_history, val_recall_history = [], []
+
+    if os.path.exists(LATEST_CHECKPOINT_PATH):
+        print(f"--- Resuming training from latest checkpoint: {LATEST_CHECKPOINT_PATH} ---")
+        # Load checkpoint to CPU first to avoid GPU memory spike
+        checkpoint = torch.load(LATEST_CHECKPOINT_PATH, map_location='cpu')
+
+        base_model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        start_epoch = checkpoint.get('epoch', 0) # Use .get for safety
+        best_val_f1 = checkpoint.get('best_val_f1', 0.0)
+
+        # Restore histories
+        histories = checkpoint.get('histories', {})
+        train_loss_history, val_loss_history = histories.get('loss', ([], []))
+        train_f1_history, val_f1_history = histories.get('f1', ([], []))
+        train_precision_history, val_precision_history = histories.get('precision', ([], []))
+        train_recall_history, val_recall_history = histories.get('recall', ([], []))
+        
+        print(f"--- Resumed from epoch {start_epoch}. Best F1 so far: {best_val_f1:.4f} ---")
+    else:
+        print("--- No checkpoint found, starting training from scratch. ---")
+    
 
     print("\nStarting training...")
     for epoch in range(EPOCHS):
         base_model.train()
         running_train_loss = 0.0
-        running_train_mae = 0.0
         running_train_f1 = 0.0
+        running_train_precision = 0.0
+        running_train_recall = 0.0
         
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Training]")
         for inputs, targets in train_pbar:
             inputs, targets = inputs.to(device), targets.to(device)
+            targets = targets[:, :, 0:1, :, :]
             optimizer.zero_grad(set_to_none=True)
             
             with torch.amp.autocast(device_type="cuda",enabled=use_amp):
@@ -125,61 +161,99 @@ if __name__ == "__main__":
             running_train_loss += loss.item()
            
             with torch.no_grad():
-                mae = torch.mean(torch.abs(outputs - targets))
-                running_train_mae += mae.item()
-                f1 = calculate_f1_score(outputs, targets, RAIN_THRESHOLD_F1)
-                running_train_f1 += f1
+                metrics = calculate_binary_metrics(outputs, targets)
+                running_train_f1 += metrics['f1']
+                running_train_precision += metrics['precision']
+                running_train_recall += metrics['recall']
 
-            train_pbar.set_postfix(loss=loss.item(), mae=mae.item(), f1=f1)
+            train_pbar.set_postfix(loss=loss.item(), f1=metrics['f1'], precision=metrics['precision'], recall=metrics['recall'])
 
         avg_train_loss = running_train_loss / len(train_loader)
-        avg_train_mae = running_train_mae / len(train_loader)
         avg_train_f1 = running_train_f1 / len(train_loader)
+        avg_train_precision = running_train_precision / len(train_loader)
+        avg_train_recall = running_train_recall / len(train_loader)
         
         base_model.eval() 
         running_val_loss = 0.0
-        running_val_mae = 0.0
         running_val_f1 = 0.0
+        running_val_precision = 0.0
+        running_val_recall = 0.0
+        is_first_batch = True 
         
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Validation]")
         with torch.no_grad():
             for inputs, targets in val_pbar:
-                inputs, targets = inputs.to(device), targets.to(device)                
+                inputs, targets = inputs.to(device), targets.to(device)
+                targets = targets[:, :, 0:1, :, :]                
                 
                 with torch.amp.autocast(device_type="cuda",enabled=use_amp):
                     outputs = base_model(inputs)
                     loss = criterion(outputs, targets)
-                
                 running_val_loss += loss.item()
-                mae = torch.mean(torch.abs(outputs - targets))
-                running_val_mae += mae.item()
-                f1 = calculate_f1_score(outputs, targets, RAIN_THRESHOLD_F1)
-                running_val_f1 += f1
-                val_pbar.set_postfix(loss=loss.item(), mae=mae.item(), f1=f1)
+                if is_first_batch:
+                    print(f"\n[Debug] Loss for first validation batch: {loss.item()}")
+                    is_first_batch = False
+                
+                metrics = calculate_binary_metrics(outputs, targets)
+                running_val_f1 += metrics['f1']
+                running_val_precision += metrics['precision']
+                running_val_recall += metrics['recall']
+                val_pbar.set_postfix(loss=loss.item(), f1=metrics['f1'], precision=metrics['precision'], recall=metrics['recall'])
 
         avg_val_loss = running_val_loss / len(val_loader)
-        avg_val_mae = running_val_mae / len(val_loader)
         avg_val_f1 = running_val_f1 / len(val_loader)
+        avg_val_precision = running_val_precision / len(val_loader)
+        avg_val_recall = running_val_recall / len(val_loader)
 
-        print(f"Epoch [{epoch+1}/{EPOCHS}] | "
-              f"Avg Train Loss: {avg_train_loss:.6f} | Avg Train MAE: {avg_train_mae:.6f} | Avg Train F1: {avg_train_f1:.4f} | "
-              f"Avg Val Loss: {avg_val_loss:.6f} | Avg Val MAE: {avg_val_mae:.6f} | Avg Val F1: {avg_val_f1:.4f}")
+        print(f"Epoch [{epoch+1}/{EPOCHS}] | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        print(f"  -> Train Metrics: F1={avg_train_f1:.4f}, Precision={avg_train_precision:.4f}, Recall={avg_train_recall:.4f}")
+        print(f"  -> Val Metrics:   F1={avg_val_f1:.4f}, Precision={avg_val_precision:.4f}, Recall={avg_val_recall:.4f}")
         
         train_loss_history.append(avg_train_loss)
         val_loss_history.append(avg_val_loss)
-        train_mae_history.append(avg_train_mae)
-        val_mae_history.append(avg_val_mae)
         train_f1_history.append(avg_train_f1)
         val_f1_history.append(avg_val_f1)
+        train_precision_history.append(avg_train_precision)
+        val_precision_history.append(avg_val_precision)
+        train_recall_history.append(avg_train_recall)
+        val_recall_history.append(avg_val_recall)
+
+        latest_checkpoint_data = {
+            'epoch': epoch + 1,
+            'model_state_dict': base_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'best_val_f1': best_val_f1,
+            'histories': {
+                'loss': (train_loss_history, val_loss_history),
+                'f1': (train_f1_history, val_f1_history),
+                'precision': (train_precision_history, val_precision_history),
+                'recall': (train_recall_history, val_recall_history),
+            }
+        }
+
+        temp_latest_path = LATEST_CHECKPOINT_PATH + ".tmp"
+        torch.save(latest_checkpoint_data, temp_latest_path)
+        shutil.move(temp_latest_path, LATEST_CHECKPOINT_PATH)
         
         if avg_val_f1 > best_val_f1:
             best_val_f1 = avg_val_f1
-            print(f"  -> New best model found! Saving model with Val F1: {best_val_f1:.4f}")
-            torch.save(base_model.state_dict(), CHECKPOINT_PATH)
+            print(f"  -> New best model found! Val F1: {best_val_f1:.4f}. Saving best checkpoint.")
+            
+            # Save the current state as the best checkpoint
+            temp_best_path = BEST_CHECKPOINT_PATH + ".tmp"
+            torch.save(latest_checkpoint_data, temp_best_path)
+            shutil.move(temp_best_path, BEST_CHECKPOINT_PATH)
+
+            # Also save a visual comparison for the best model
             save_validation_comparison(base_model, val_loader, device,
-                                       save_path=os.path.join(OUTPUT_DIR, "validation_comparison.png"))
-        plot_history(train_loss_history, val_loss_history, train_mae_history, val_mae_history, train_f1_history, val_f1_history,
-                 save_path=os.path.join(OUTPUT_DIR, "training_history.png"))
+                                    save_path=os.path.join(OUTPUT_DIR, f"validation_comparison_{epoch}.png"))
+        plot_history({
+                        'loss': (train_loss_history, val_loss_history),
+                        'f1': (train_f1_history, val_f1_history),
+                        'precision': (train_precision_history, val_precision_history),
+                        'recall': (train_recall_history, val_recall_history),
+                    }, save_path=os.path.join(OUTPUT_DIR, "training_history.png"))
 
     print("\nTraining finished.")
-    print(f"Best model saved at {CHECKPOINT_PATH} with a validation MAE of {best_val_mae:.6f}")
+    print(f"Best model saved at {BEST_CHECKPOINT_PATH} with a validation F1-score of {best_val_f1:.4f}")
