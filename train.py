@@ -32,14 +32,16 @@ if torch.cuda.is_available():
 
 torch.set_float32_matmul_precision('high')
 
-DATA_DIR  = "/wetter/input/WetterDatenSmol/"
-CACHE_DIR = "/wetter/input/WetterDatenCacheSmol/"
+DATA_DIR  = "/wetter/input/WetterDaten/"
+#pre generated video cache under 
+#CACHE_DIR = "/wetter/input/WetterDatenCacheSmol/"
+CACHE_DIR = "/wetter/input/WetterDatenCache/"
 
 
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
-BATCH_SIZE = 8
-EPOCHS = 10
+BATCH_SIZE = 16
+EPOCHS = 120*2
 
 VALIDATION_SPLIT = 0.2 
 
@@ -74,7 +76,9 @@ if __name__ == "__main__":
         cache_dir=CACHE_DIR,
         window_size=WINDOW_SIZE,
         prediction=PREDICTION_STEPS,
-        transform=None
+        transform=None,
+        cache_type='tensor',
+        precision='uint8'
     )
     
     val_size = int(len(full_dataset) * VALIDATION_SPLIT)
@@ -85,8 +89,8 @@ if __name__ == "__main__":
     print(f"Training set size: {len(train_dataset)}")
     print(f"Validation set size: {len(val_dataset)}")
  
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=10,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=10, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8,pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
   
     print("Initializing model...")
     base_model = SpatioTemporalTransformer(
@@ -94,7 +98,9 @@ if __name__ == "__main__":
         patch_size=PATCH_SIZE,
         window_size=WINDOW_SIZE,
         in_chans=3, 
-        embed_dim=192,
+        embed_dim=96,
+        depth=3,
+        num_heads=4,
         num_predictions=NUM_PREDICTIONS
     ).to(device)
     
@@ -178,7 +184,6 @@ if __name__ == "__main__":
         running_val_f1 = 0.0
         running_val_precision = 0.0
         running_val_recall = 0.0
-        is_first_batch = True 
         
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Validation]")
         with torch.no_grad():
@@ -190,9 +195,6 @@ if __name__ == "__main__":
                     outputs = base_model(inputs)
                     loss = criterion(outputs, targets)
                 running_val_loss += loss.item()
-                if is_first_batch:
-                    print(f"\n[Debug] Loss for first validation batch: {loss.item()}")
-                    is_first_batch = False
                 
                 metrics = calculate_binary_metrics(outputs, targets)
                 running_val_f1 += metrics['f1']
